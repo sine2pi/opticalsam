@@ -1,11 +1,4 @@
 
-"""
-Augments SAM3's deep memory bank with RAFT optical flow as an explicit
-spatial prior. Works by injecting RAFT-warped mask prompts into SAM3's
-per_frame_geometric_prompt slots, so the tracker sees BOTH its own
-temporal memory AND our geometric motion prediction each frame.
-"""
-
 import cv2, torch, subprocess, numpy as np, json, logging
 from skimage.color import lab2rgb, rgb2lab
 from sklearn.cluster import KMeans
@@ -67,6 +60,7 @@ def metadata(path):
     return nb_frames, num_keyframes, width, height, duration, fps
 
 def ffmpeg_pipe(out_path, width, height, fps):
+    
     ffmpeg_cmd = [
         'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
         '-s', f'{width}x{height}', '-pix_fmt', 'bgr24', '-r', str(fps),
@@ -125,15 +119,35 @@ class RaftMotionCompensator:
         return flow
 
     def _warp_frame(self, pt_frame, flow, t=1.0):
-        C, H, W = pt_frame.shape
-        flow_scaled = flow * t
-        y, x = torch.meshgrid(torch.arange(H, device=self.device), torch.arange(W, device=self.device), indexing='ij')
-        x_norm = 2.0 * (x + flow_scaled[0]) / max(W - 1, 1) - 1.0
-        y_norm = 2.0 * (y + flow_scaled[1]) / max(H - 1, 1) - 1.0
-        grid = torch.stack((x_norm, y_norm), dim=-1).unsqueeze(0)
-        return F.grid_sample(
-            pt_frame.unsqueeze(0), grid, mode='bilinear', padding_mode='border', align_corners=False
-        ).squeeze(0)
+        if pt_frame.ndim == 3:
+            C, H, W = pt_frame.shape
+            flow_scaled = flow * t
+            y, x = torch.meshgrid(torch.arange(H, device=self.device), torch.arange(W, device=self.device), indexing='ij')
+            x_norm = 2.0 * (x + flow_scaled[0]) / max(W - 1, 1) - 1.0
+            y_norm = 2.0 * (y + flow_scaled[1]) / max(H - 1, 1) - 1.0
+            grid = torch.stack((x_norm, y_norm), dim=-1).unsqueeze(0)
+            
+            align_corners = True if self.interp_mode != 'nearest' else None
+            if align_corners is None:
+                return F.grid_sample(pt_frame.unsqueeze(0), grid, mode=self.interp_mode, padding_mode='border').squeeze(0)
+            else:
+                return F.grid_sample(pt_frame.unsqueeze(0), grid, mode=self.interp_mode, padding_mode='border', align_corners=align_corners).squeeze(0)
+        elif pt_frame.ndim == 4:
+            N, C, H, W = pt_frame.shape
+            flow_scaled = flow * t
+            y, x = torch.meshgrid(torch.arange(H, device=self.device), torch.arange(W, device=self.device), indexing='ij')
+            x_norm = 2.0 * (x + flow_scaled[0]) / max(W - 1, 1) - 1.0
+            y_norm = 2.0 * (y + flow_scaled[1]) / max(H - 1, 1) - 1.0
+            grid = torch.stack((x_norm, y_norm), dim=-1).unsqueeze(0)
+            grid = grid.expand(N, -1, -1, -1)
+            
+            align_corners = True if self.interp_mode != 'nearest' else None
+            if align_corners is None:
+                return F.grid_sample(pt_frame, grid, mode=self.interp_mode, padding_mode='border')
+            else:
+                return F.grid_sample(pt_frame, grid, mode=self.interp_mode, padding_mode='border', align_corners=align_corners)
+        else:
+            raise ValueError(f"Unexpected pt_frame dimensions: {pt_frame.ndim}")
 
     def stabilize_alpha_sequence(self, rgb_frames, alpha_masks, blend_weights=(0.2, 0.6, 0.2)):
         self._load_model()
@@ -186,18 +200,7 @@ class HybridSam3MotionLoop:
         self.target_res = target_res
 
     def process_batch(self, frames_pil, frames_bgr, prompt_text=None, bbox=None):
-        """
-        Process a batch of frames end-to-end:
-        1. Run vanilla propagation -> baseline vanilla masks & soft probabilities.
-        2. Run true inline augmentation loop:
-           - Prompt frame 0.
-           - For frame i in 1..N-1:
-             - Warp prev_logits to frame i via RAFT flow.
-             - Inject warped logits into low-level tracker as the prior on frame i.
-             - Run tracker step to combine the warped prior with deep memory & image features.
-             - Keep track of predictions.
-        Returns vanilla_masks, final_masks (inline-stabilized), sam_soft (vanilla), stabilized_soft (inline).
-        """
+
         self.raft._load_model()
         height, width = frames_bgr[0].shape[:2]
         chunk_length = len(frames_pil)
@@ -293,6 +296,7 @@ class HybridSam3MotionLoop:
             tensors_rgb.append(t_rgb)
 
         prev_logits = tracker_state["output_dict"]["cond_frame_outputs"][0]["pred_masks"].to(self.device).float()
+        batch_size = len(tracker_state["obj_ids"])
 
         self.predictor.model.tracker.propagate_in_video_preflight(
             tracker_state, run_mem_encoder=True
@@ -312,24 +316,23 @@ class HybridSam3MotionLoop:
                 _, _, h_mask, w_mask = prev_logits.shape
                 flow = self.raft._compute_raft_flow(prev_tensor.unsqueeze(0), curr_tensor.unsqueeze(0)).squeeze(0)
                 flow_downscaled = torch.nn.functional.interpolate(
-                    flow.unsqueeze(0), size=(h_mask, w_mask), mode="bilinear", align_corners=False
+                    flow.unsqueeze(0), size=(h_mask, w_mask), mode="bicubic", align_corners=False
                 ).squeeze(0)
                 flow_downscaled[0] *= (w_mask / width)
                 flow_downscaled[1] *= (h_mask / height)
                 
-                warped_logits = self.raft._warp_frame(prev_logits.squeeze(0), flow_downscaled)
-                warped_logits = warped_logits.unsqueeze(0)
+                warped_logits = self.raft._warp_frame(prev_logits, flow_downscaled)
 
                 dummy_point_inputs = {
-                    "point_coords": torch.zeros(1, 1, 2, device=self.device),
-                    "point_labels": -torch.ones(1, 1, dtype=torch.int32, device=self.device)
+                    "point_coords": torch.zeros(batch_size, 1, 2, device=self.device),
+                    "point_labels": -torch.ones(batch_size, 1, dtype=torch.int32, device=self.device)
                 }
 
                 current_out, _ = self.predictor.model.tracker._run_single_frame_inference(
                     inference_state=tracker_state,
                     output_dict=tracker_state["output_dict"],
                     frame_idx=frame_idx,
-                    batch_size=1,
+                    batch_size=batch_size,
                     is_init_cond_frame=False,
                     point_inputs=dummy_point_inputs,
                     mask_inputs=None,
@@ -568,25 +571,3 @@ test_simple_video_batch(
     prompt_text="One girl",
     batch_size=100,
 )
-
-# ===========================================================================
-#            QUANTITATIVE TRACKING STABILITY REPORT
-# ===========================================================================
-# Metric                              | Vanilla SAM3    | Hybrid SAM3+RAFT
-# ---------------------------------------------------------------------------
-# Mean Warping IoU (higher=best)      | 0.996138          | 0.996198
-# Std Warping IoU (lower=best)        | 0.001417          | 0.001358
-# Mean Consecutive IoU (higher=best)  | 0.997778          | 0.997840
-# Std Consecutive IoU (lower=best)    | 0.001145          | 0.001085
-# Mean Perimeter Jitter (lower=best)  | 2.89           | 11.41
-# Std Perimeter Jitter (lower=best)   | 3.17           | 18.24
-# ---------------------------------------------------------------------------
-# Mean Soft Warping IoU (higher=best) | 0.992781          | 0.993976
-# Std Soft Warping IoU (lower=best)   | 0.001172          | 0.001645
-# Mean Soft Consecutive IoU (hi=best) | 0.997778          | 0.997697
-# Std Soft Consecutive IoU (lo=best)  | 0.001145          | 0.001956
-# ===========================================================================
-# [DEBUG] Total binarized mask pixels: 89128960
-# [DEBUG] Differing binarized mask pixels: 49015 (0.054993%)
-# ===========================================================================
-
