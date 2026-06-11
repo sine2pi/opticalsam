@@ -192,7 +192,7 @@ class HybridSam3MotionLoop:
         self.device = self.raft.device
         self.target_res = target_res
 
-    def process_batch(self, frames_pil, frames_bgr, prompt_text=None, bbox=None):
+    def process_batch(self, frames_pil, frames_bgr, prompt_text=None, bbox=None, prior_mask=None):
    
         self.raft._load_model()
         height, width = frames_bgr[0].shape[:2]
@@ -204,14 +204,24 @@ class HybridSam3MotionLoop:
         ))
         sid_vanilla = res_vanilla["session_id"]
 
+        if prior_mask is not None:
+            self.predictor.handle_request(dict(
+                type="add_new_mask",
+                session_id=sid_vanilla,
+                frame_index=0,
+                obj_id=0,
+                mask=prior_mask
+            ))
+            
         prompt_req_vanilla = dict(type="add_prompt", session_id=sid_vanilla, frame_index=0, obj_id=0)
         if prompt_text is not None:
             prompt_req_vanilla["text"] = prompt_text
         if bbox is not None:
             prompt_req_vanilla["bounding_boxes"] = [bbox]
             prompt_req_vanilla["bounding_box_labels"] = [1]
-
-        self.predictor.handle_request(prompt_req_vanilla)
+            
+        if prompt_text is not None or bbox is not None or prior_mask is None:
+            self.predictor.handle_request(prompt_req_vanilla)
 
         out_buffer_vanilla = []
         for st in self.predictor.handle_stream_request(dict(
@@ -266,20 +276,36 @@ class HybridSam3MotionLoop:
         ))
         sid_inline = res_inline["session_id"]
 
+        if prior_mask is not None:
+            self.predictor.handle_request(dict(
+                type="add_new_mask",
+                session_id=sid_inline,
+                frame_index=0,
+                obj_id=0,
+                mask=prior_mask
+            ))
+            
         prompt_req_inline = dict(type="add_prompt", session_id=sid_inline, frame_index=0, obj_id=0)
         if prompt_text is not None:
             prompt_req_inline["text"] = prompt_text
         if bbox is not None:
             prompt_req_inline["bounding_boxes"] = [bbox]
             prompt_req_inline["bounding_box_labels"] = [1]
-
-        self.predictor.handle_request(prompt_req_inline)
+            
+        if prompt_text is not None or bbox is not None or prior_mask is None:
+            self.predictor.handle_request(prompt_req_inline)
 
         session_inline = self.predictor._get_session(sid_inline)
         inference_state = session_inline["state"]
         tracker_states = inference_state["tracker_inference_states"]
+
         if len(tracker_states) == 0:
-            raise RuntimeError("No tracker state found after adding prompt to inline session!")
+            print(f"[WARNING] Prompt '{prompt_text}' found no objects in this chunk. Generating empty masks.")
+            self.predictor.handle_request(dict(type="close_session", session_id=sid_inline))
+            final_masks = [np.zeros((height, width), dtype=np.uint8) for _ in range(chunk_length)]
+            stabilized_soft = [np.zeros((height, width), dtype=np.float32) for _ in range(chunk_length)]
+            return vanilla_masks, final_masks, sam_soft, stabilized_soft
+            
         tracker_state = tracker_states[0]
 
         tensors_rgb = []
@@ -349,6 +375,9 @@ class HybridSam3MotionLoop:
             out = tracker_state["output_dict"][storage_key][i]
             
             logits_gpu = out["pred_masks_high_res"].to(self.device) if "pred_masks_high_res" in out else out["pred_masks"].to(self.device)
+            if logits_gpu.shape[0] > 0:
+                logits_gpu = torch.max(logits_gpu, dim=0, keepdim=True).values
+                
             logits_resized = torch.nn.functional.interpolate(
                 logits_gpu,
                 size=(height, width),
@@ -471,6 +500,8 @@ def test_simple_video_batch(video_path, out_path, prompt_text="One girl", batch_
     all_vanilla_soft_masks = []
     all_hybrid_soft_masks = []
 
+    last_mask = None
+
     while frame_count < total_frames:
         frames_bgr = []
         for _ in range(batch_size):
@@ -489,12 +520,17 @@ def test_simple_video_batch(video_path, out_path, prompt_text="One girl", batch_
             frames_pil.append(Image.fromarray(rgb))
 
         print(f"\nProcessing Batch (Frames {frame_count} to {frame_count+chunk_length})...")
+        
+        valid_prior = last_mask if (last_mask is not None and np.sum(last_mask) > 0) else None
 
         vanilla_masks, final_masks, sam_soft, stabilized_soft = hybrid_loop.process_batch(
             frames_pil=frames_pil,
             frames_bgr=frames_bgr,
             prompt_text=prompt_text,
+            prior_mask=valid_prior
         )
+        
+        last_mask = final_masks[-1]
         
         torch.cuda.empty_cache()
 
@@ -559,8 +595,8 @@ def test_simple_video_batch(video_path, out_path, prompt_text="One girl", batch_
     print("="*75)
 
 test_simple_video_batch(
-    video_path="video.mp4",
+    video_path="motion_r.mp4",
     out_path="output.mp4",
-    prompt_text="One girl",
-    batch_size=100,
+    prompt_text="One man",
+    batch_size=32,
 )
