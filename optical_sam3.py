@@ -1,8 +1,4 @@
-
 import cv2, torch, subprocess, numpy as np, json, logging
-from skimage.color import lab2rgb, rgb2lab
-from sklearn.cluster import KMeans
-import torchvision.transforms.functional as TVF
 import torch.nn.functional as F
 from tqdm import tqdm
 from PIL import Image
@@ -14,8 +10,6 @@ try:
 except ImportError:
     HAS_RAFT = False
 
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 dtype = torch.float32
 logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -60,7 +54,6 @@ def metadata(path):
     return nb_frames, num_keyframes, width, height, duration, fps
 
 def ffmpeg_pipe(out_path, width, height, fps):
-    
     ffmpeg_cmd = [
         'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
         '-s', f'{width}x{height}', '-pix_fmt', 'bgr24', '-r', str(fps),
@@ -200,7 +193,7 @@ class HybridSam3MotionLoop:
         self.target_res = target_res
 
     def process_batch(self, frames_pil, frames_bgr, prompt_text=None, bbox=None):
-
+   
         self.raft._load_model()
         height, width = frames_bgr[0].shape[:2]
         chunk_length = len(frames_pil)
@@ -566,7 +559,7 @@ def test_simple_video_batch(video_path, out_path, prompt_text="One girl", batch_
     print("="*75)
 
 test_simple_video_batch(
-    video_path="test.mp4",
+    video_path="video.mp4",
     out_path="output.mp4",
     prompt_text="One girl",
     batch_size=100,
