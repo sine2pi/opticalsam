@@ -689,33 +689,34 @@ def build_sam3_video_model(
         supervise_joint_box_scores=has_presence_token,
     )
 
-    # Build the main SAM3 video model
     if apply_temporal_disambiguation:
         model = Sam3VideoInferenceWithInstanceInteractivity(
             detector=detector,
             tracker=tracker,
-            score_threshold_detection=0.5,
-            assoc_iou_thresh=0.1,
+            score_threshold_detection=0.65,
+            assoc_iou_thresh=0.3,
             det_nms_thresh=0.1,
-            new_det_thresh=0.7,
-            hotstart_delay=15,
-            hotstart_unmatch_thresh=8,
-            hotstart_dup_thresh=8,
-            suppress_unmatched_only_within_hotstart=True,
+            new_det_thresh=0.99,
+            hotstart_delay=8,
+            hotstart_unmatch_thresh=5,
+            hotstart_dup_thresh=5,
+            suppress_unmatched_only_within_hotstart=False,
             min_trk_keep_alive=-1,
-            max_trk_keep_alive=30,
-            init_trk_keep_alive=30,
-            suppress_overlapping_based_on_recent_occlusion_threshold=0.7,
-            suppress_det_close_to_boundary=False,
-            fill_hole_area=16,
-            recondition_every_nth_frame=16,
-            masklet_confirmation_enable=False,
-            decrease_trk_keep_alive_for_empty_masklets=False,
+            max_trk_keep_alive=100,
+            init_trk_keep_alive=5,
+            suppress_overlapping_based_on_recent_occlusion_threshold=0.9,
+            suppress_det_close_to_boundary=True,
+            fill_hole_area=4,
+            recondition_every_nth_frame=64,
+            masklet_confirmation_enable=True,
+            decrease_trk_keep_alive_for_empty_masklets=True,
             image_size=1008,
             image_mean=(0.5, 0.5, 0.5),
             image_std=(0.5, 0.5, 0.5),
             compile_model=compile,
         )
+
+
     else:
         # a version without any heuristics for ablation studies
         model = Sam3VideoInferenceWithInstanceInteractivity(
