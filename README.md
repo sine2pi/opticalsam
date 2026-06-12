@@ -1,5 +1,5 @@
 Uses SAM3 and RAFT as a motion compensated geometric priori (motion guided prompting)
-
+No skipped frames no flickering.
 
 
 
